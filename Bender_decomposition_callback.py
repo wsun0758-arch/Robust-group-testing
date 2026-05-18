@@ -1,12 +1,564 @@
-import gurobipy as gp
 from gurobipy import Model, GRB, quicksum
-from numpy import random
+from concurrent.futures import ThreadPoolExecutor
+import random
 import numpy as np
-import timeit,itertools
+import pandas as pd
+import timeit
+import itertools
+
 
 # Parameters
-T = 3  # Number of tests
-K = 4  # Number of scenarios
+T = 10 # Number of tests
+K = 5 # Number of scenarios
+n = 10  # Number of entities
+G = n  # Max number items in each group
+r = T # Max times items tested in group tests
+# In[1]
+def solve_subproblem(x_fixed, T, d):
+    # Number of items
+    n=len(d) 
+        
+    # Create a subproblem model
+    sub = Model("Maximization Problem")
+    
+    sub.params.OutputFlag = 0
+    sub.params.LogToConsole = 0
+    
+    # Decision variables
+    z_0_i = sub.addVars(n, vtype=GRB.BINARY, name="z_0_i")
+    z_1_i = sub.addVars(n, vtype=GRB.BINARY, name="z_1_i")
+    z_0_ti = sub.addVars(T, n, vtype=GRB.BINARY, name="z_0_ti")
+    z_1_ti = sub.addVars(T, n,vtype=GRB.BINARY, name="z_1_ti")
+
+    # Objective function
+    sub.setObjective(
+        quicksum(z_0_i[i] + z_1_i[i] for i in range(n)), GRB.MAXIMIZE
+    )
+
+    # Constraints
+    # z_{ti}^0 ≤ x_{ti}
+    sub.addConstrs((z_0_ti[t, i] <= x_fixed[t, i] for t in range(T) for i in range(n)), "C1")
+
+    # z_{ti}^0 ≤ 1 - d_j * x_{tj}, for all t, i, j
+    sub.addConstrs(
+        (z_0_ti[t, i] <= 1 - d[j] * x_fixed[t, j] for t in range(T) for i in range(n) for j in range(n)), "C2"
+    )
+
+    # z_{i}^0 ≤ ∑_{t} z_{ti}^0
+    sub.addConstrs((z_0_i[i] <= quicksum(z_0_ti[t, i] for t in range(T)) for i in range(n)), "C3")
+
+    # z_{ti}^1 ≤ x_{ti}
+    sub.addConstrs((z_1_ti[t, i] <= x_fixed[t, i] for t in range(T) for i in range(n)), "C4")
+
+    # z_{ti}^1 ≤ ∑_{j} d_j * x_{tj}
+    sub.addConstrs(
+        (z_1_ti[t, i] <= quicksum(d[j] * x_fixed[t, j] for j in range(n)) for t in range(T) for i in range(n)), "C5"
+    )
+
+    # z_{ti}^1 ≤ 1 - x_{tj} + z_{j}^0, for all t, i ≠ j
+    sub.addConstrs(
+        (z_1_ti[t, i] <= 1 - x_fixed[t, j] + z_0_i[j] for t in range(T) for i in range(n) for j in range(n) if i != j), "C6"
+    )
+
+    # z_{i}^1 ≤ ∑_{t} z_{ti}^1
+    sub.addConstrs((z_1_i[i] <= quicksum(z_1_ti[t, i] for t in range(T)) for i in range(n)), "C7")
+ 
+    # Solve the sub
+    sub.optimize()
+
+    # Output the results
+    if sub.status == GRB.OPTIMAL:
+        return sub.Objval,sub.status
+    else:
+        return [1e+5,0]
+# In[2]
+def solve_subproblem_Dual(x_fixed, T,d):
+    # number of items
+    n=len(d)
+    
+    sub = Model("Subproblem")
+    sub.params.OutputFlag = 0
+    sub.params.LogToConsole = 0
+    
+    # Variables
+    v_0 = sub.addVars(n, vtype=GRB.CONTINUOUS, lb=0, name="v_0")
+    v_1 = sub.addVars(n, vtype=GRB.CONTINUOUS, lb=0, name="v_1")
+    xi = sub.addVars(n, vtype=GRB.CONTINUOUS, lb=0, name="xi")
+    eta = sub.addVars(n, vtype=GRB.CONTINUOUS, lb=0, name="eta")
+    u_0_ti = sub.addVars(T, n, vtype=GRB.CONTINUOUS, lb=0, name="u_0_ti")
+    u_1_ti = sub.addVars(T, n, vtype=GRB.CONTINUOUS, lb=0, name="u_1_ti")
+    u_2_ti = sub.addVars(T, n, vtype=GRB.CONTINUOUS, lb=0, name="u_2_ti")
+    v_0_ti = sub.addVars(T, n, vtype=GRB.CONTINUOUS, lb=0, name="v_0_ti")
+    v_1_ti = sub.addVars(T, n, vtype=GRB.CONTINUOUS, lb=0, name="v_1_ti")
+    u_0_tij = sub.addVars(T, n, n, vtype=GRB.CONTINUOUS, lb=0, name="u_0_tij")
+    u_1_tij = sub.addVars(T, n, n, vtype=GRB.CONTINUOUS, lb=0, name="u_1_tij")
+
+    # Objective function
+    sub.setObjective(
+        quicksum(u_0_ti[t, i] * x_fixed[t, i] + u_1_ti[t, i] * x_fixed[t, i] for t in range(T) for i in range(n)) +
+        quicksum(u_2_ti[t, i] * quicksum(d[j] * x_fixed[t, j] for j in range(n)) for t in range(T) for i in range(n)) +
+        quicksum(u_0_tij[t, i, j] * (1 - d[j] * x_fixed[t, j]) for t in range(T) for i in range(n) for j in range(n)) +
+        quicksum(u_1_tij[t, i, j] * (1 - x_fixed[t, j]) for t in range(T) for i in range(n) for j in range(n) if j != i) +
+        quicksum(v_0[i] + v_1[i] for i in range(n)) +
+        quicksum(v_0_ti[t, i] + v_1_ti[t, i] for t in range(T) for i in range(n)),
+        GRB.MINIMIZE
+    )
+    
+    # Add subproblem constraints
+    sub.addConstrs(
+       (u_0_ti[t, i] + quicksum(u_0_tij[t, i, j] for j in range(n)) + v_0_ti[t, i] - xi[i] >= 0 for t in range(T) for i in range(n)),
+       "Constraint1"
+    )
+    
+    sub.addConstrs(
+    (v_0[i] - quicksum(u_1_tij[t, i, j] for t in range(T) for j in range(n) if j != i) +xi[i] >= 1 for i in range(n)),
+    "Constraint2"
+    )
+    
+    sub.addConstrs(
+    (u_1_ti[t, i] + u_2_ti[t, i] + quicksum(u_1_tij[t, i, j] for j in range(n) if j != i) + v_1_ti[t, i] - eta[i] >= 0 for t in range(T) for i in range(n)),
+    "Constraint3"
+    )
+
+    sub.addConstrs(
+        (v_1[i] + eta[i] >= 1 for i in range(n)),
+        "Constraint4"
+    )    
+
+    # Solve subproblem
+    sub.setParam(GRB.Param.InfUnbdInfo, 1)
+    sub.update()
+    sub.optimize()
+
+    n_certified = sub.objval
+    
+    # Fix decision variables for subproblem
+    u_0_ti_fixed=[]
+    u_0_tij_fixed=[]
+    u_1_ti_fixed=[]
+    u_1_tij_fixed=[]
+    u_2_ti_fixed=[]
+    v_0_fixed=[]
+    v_1_fixed=[]
+    v_0_ti_fixed=[]
+    v_1_ti_fixed=[]
+    if sub.status == GRB.OPTIMAL:
+            u_0_ti_fixed = {(t, i): u_0_ti[t, i].x for t in range(T) for i in range(n)}
+            u_1_ti_fixed = {(t, i): u_1_ti[t, i].x for t in range(T) for i in range(n)}
+            u_2_ti_fixed = {(t, i): u_2_ti[t, i].x for t in range(T) for i in range(n)}
+            u_0_tij_fixed = {(t, i, j): u_0_tij[t, i, j].x for t in range(T) for i in range(n) for j in range(n)}
+            u_1_tij_fixed = {(t, i, j): u_1_tij[t, i, j].x for t in range(T) for i in range(n) for j in range(n)}
+            v_0_fixed = {i: v_0[i].x  for i in range(n)}
+            v_1_fixed = {i: v_1[i].x  for i in range(n)}
+            v_0_ti_fixed = {(t, i): v_0_ti[t, i].x for t in range(T) for i in range(n)}
+            v_1_ti_fixed = {(t, i): v_1_ti[t, i].x for t in range(T) for i in range(n)}
+    else:
+         if sub.status == GRB.UNBOUNDED:
+            u_0_ti_fixed = {(t, i): u_0_ti[t, i].UnbdRay for t in range(T) for i in range(n)}
+            u_1_ti_fixed = {(t, i): u_1_ti[t, i].UnbdRay for t in range(T) for i in range(n)}
+            u_2_ti_fixed = {(t, i): u_2_ti[t, i].UnbdRay for t in range(T) for i in range(n)}
+            u_0_tij_fixed = {(t, i, j): u_0_tij[t, i,j].UnbdRay for t in range(T) for i in range(n) for j in range(n)}
+            u_1_tij_fixed = {(t, i, j): u_1_tij[t, i, j].UnbdRay for t in range(T) for i in range(n) for j in range(n)}
+            v_0_fixed = {i: v_0[i].UnbdRay for i in range(n)}
+            v_1_fixed = {i: v_1[i].UnbdRay for i in range(n)}
+            v_0_ti_fixed = {(t, i): v_0_ti[t, i].UnbdRay for t in range(T) for i in range(n)}
+            v_1_ti_fixed = {(t, i): v_1_ti[t, i].UnbdRay for t in range(T) for i in range(n)}
+
+    return n_certified, (u_0_ti_fixed, u_1_ti_fixed,u_1_tij_fixed,u_2_ti_fixed,u_0_tij_fixed,v_0_ti_fixed,v_1_ti_fixed,v_0_fixed, v_1_fixed),sub.status
+# In[3]
+def benders_callback(model, where):
+     global ub,lb,Upperbound,Lowerbound,x_opt,b_opt,min_result,results,iteration,max_iteration
+     if Upperbound-Lowerbound > 1:
+       if where == GRB.Callback.MIPSOL and iteration<max_iteration:
+              iteration=iteration+1
+              
+              # 1. Get current best solution and objective value
+              x_vals = model.cbGetSolution(model._x)
+              b_vals = model.cbGetSolution(model._b)
+              R_val = model.cbGetSolution(model._R)
+              x_vals = np.array([[x_vals[t, i] for i in range(n)] for t in range(T)])
+              b_vals = np.array([b_vals[t] for t in range(T)])
+             
+              # 2. Parallel execution of subproblems
+              def solve_one_scenario(d):
+                 return d, solve_subproblem_Dual(x_vals, T, d)
+              
+              with ThreadPoolExecutor(max_workers=K) as executor:
+                 results = list(executor.map(solve_one_scenario, D))
+               
+              min_result = min(results, key=lambda x: x[1][0])
+              d = min_result[0]
+              secondstage_optval = min_result[1][0]
+              params = min_result[1][1]
+              
+              u_0_ti_fixed, u_1_ti_fixed,u_1_tij_fixed,u_2_ti_fixed,u_0_tij_fixed,v_0_ti_fixed,v_1_ti_fixed,v_0_fixed, v_1_fixed = params
+              
+              # 3. Check if R is overestimating
+              if R_val > secondstage_optval:
+                  # 4. Add lazy constraint (optimality cut)
+                  model.cbLazy(quicksum(u_0_ti_fixed[t, i] * model._x[t, i] + u_1_ti_fixed[t, i] * model._x[t, i] for t in range(T) for i in range(n)) +
+                  quicksum(u_2_ti_fixed[t, i] * quicksum(d[j] * model._x[t, j] for j in range(n)) for t in range(T) for i in range(n)) +
+                  quicksum(u_0_tij_fixed[t, i, j] * (1 - d[j] * model._x[t, j]) for t in range(T) for i in range(n) for j in range(n)) +
+                  quicksum(u_1_tij_fixed[t, i, j] * (1 - model._x[t, j]) for t in range(T) for i in range(n) for j in range(n) if j != i) +
+                  quicksum(v_0_fixed[i] + v_1_fixed[i] for i in range(n)) +
+                  quicksum(v_0_ti_fixed[t, i] + v_1_ti_fixed[t, i] for t in range(T) for i in range(n))
+                       >= model._R)
+                  
+              # 5. Update bounds
+              temp=n+sum(b_vals[t] for t in range(T))-secondstage_optval
+              if temp<Upperbound:
+                  Upperbound=temp
+                 # print("Upperbound"+str(Upperbound))
+                  x_opt=x_vals
+                  b_opt=b_vals
+                  Lowerbound=n+sum(b_vals[t] for t in range(T))-R_val
+              ub.append(Upperbound)
+              lb.append(Lowerbound)
+     else:
+            model.terminate()
+         # In[4]
+def Bender_decomposition(T,D):
+   global ub,lb,Upperbound,Lowerbound,x_opt,b_opt,iteration,max_iteration#,Benders_D
+   
+#   print("Benders "+str(D))
+#   Benders_D=D
+   
+   # Initialize parameters
+   Upperbound=1e+5
+   Lowerbound=-1e+5
+   x_opt=np.zeros((T,n)) 
+   b_opt=np.zeros(n) 
+   iteration=0
+   max_iteration=100
+   gap=0 
+   ub=[]
+   lb=[]
+   
+   # Initialize Master Problem
+   master = Model("Master Problem")
+   x = master.addVars(T, n, vtype=GRB.BINARY, name="x")  # First-stage decision variable
+   b = master.addVars(T, vtype=GRB.BINARY, name="b")  # Testing decision variable
+   R = master.addVar(vtype=GRB.CONTINUOUS, lb=0, ub=G, name="R")  # Auxilary variable
+   
+   master.params.OutputFlag = 0
+   master.params.LogToConsole = 0
+#   master.params.MIPGap = 0.1
+#   master.params.MIPGapAbs = 0
+   master.setParam('TimeLimit', 1800)
+   
+   # Master problem objective
+   master.setObjective(n + quicksum(b[t] for t in range(T)) - R, GRB.MINIMIZE)
+   
+   # Capacity constraints
+   master.addConstrs((quicksum(x[t, i] for i in range(n)) <= G * b[t] for t in range(T)), name="Capacity")
+   
+   # Test number constraints
+   master.addConstrs((quicksum(x[t, i]  for t in range(T)) <= r for i in range(n)), name="Test size")    
+   
+   # Store variables for callback
+   master._x = x
+   master._R = R
+   master._b = b
+   master.Params.LazyConstraints = 1  # Must be set!
+    
+   master.optimize(benders_callback)
+
+   runtime = master.Runtime
+   if master.status!=GRB.OPTIMAL:
+       gap = master.MIPGap
+   
+   return x_opt,b_opt, ub,lb,Upperbound, gap,master.status, runtime
+# In[5]
+# Bender decompostion
+def Bender_decomposition_2(T,D):
+   start = timeit.default_timer()
+  
+   # Number of items
+   n=len(D[0]) 
+   
+      
+   # Initialize Master Problem
+   master = Model("Master Problem")
+   x = master.addVars(T, n, vtype=GRB.BINARY, name="x")  # First-stage decision variable
+   b = master.addVars(T, vtype=GRB.BINARY, name="b")  # Testing decision variable
+   R = master.addVar(vtype=GRB.CONTINUOUS, lb=0, ub=G, name="R")  # Auxilary variable
+   
+   master.params.OutputFlag = 0
+   master.params.LogToConsole = 0
+#   master.params.MIPGap = 0.1
+#   master.params.MIPGapAbs = 0
+   master.setParam('TimeLimit', 1800)
+   
+   # Master problem objective
+   master.setObjective(n + quicksum(b[t] for t in range(T)) - R, GRB.MINIMIZE)
+   
+   # Capacity constraints
+   for t in range(T):
+       master.addConstr(quicksum(x[t, i] for i in range(n)) <= G * b[t], name=f"Capacity_{t}")
+       
+   # Test number constraints
+   master.addConstrs((quicksum(x[t, i]  for t in range(T)) <= r for i in range(n)), name="Test size") 
+
+   # Second stage objective value
+   secondstage_optval=1e+5
+
+   # Iterative Benders decomposition
+   Upperbound=1e+5
+   Lowerbound=n+T-secondstage_optval
+   LB=[]
+   UB=[]
+
+   #Initialize iteration
+   iteration=0
+
+     
+   while Upperbound-Lowerbound > 0 and iteration<100:
+       iteration = iteration+1
+       # Solve master problem and update the lower bound
+       master.optimize()
+       if master.status == GRB.OPTIMAL:
+            # Fix x variables for subproblem
+            x_fixed = {(t, i): x[t, i].x for t in range(T) for i in range(n)}
+            x_fixed = np.reshape(np.array(list(x_fixed.values())),(T,n))
+            # Output b variables for subproblem
+            b_t = {t: b[t].x for t in range(T)}
+            b_t = np.array(list(b_t.values()))
+            # Update the lower bound
+            Lowerbound = master.ObjVal
+            LB.append(Lowerbound)
+       else:
+            break
+     
+       # 1. Second stage objective value
+       secondstage_optval=1e+5
+
+       # 2. Parallel execution of subproblems
+       def solve_one_scenario(d):
+          return d, solve_subproblem_Dual(x_fixed, T, d)
+       
+       with ThreadPoolExecutor(max_workers=K) as executor:
+          results = list(executor.map(solve_one_scenario, D))
+
+       min_result = min(results, key=lambda x: x[1][0])
+       d = min_result[0]
+       secondstage_optval = min_result[1][0]
+       params = min_result[1][1]
+       
+       u_0_ti_fixed, u_1_ti_fixed,u_1_tij_fixed,u_2_ti_fixed,u_0_tij_fixed,v_0_ti_fixed,v_1_ti_fixed,v_0_fixed, v_1_fixed = params
+      
+       # 3. Add optimality cut
+       master.addConstr(quicksum(u_0_ti_fixed[t, i] * x[t, i] + u_1_ti_fixed[t, i] * x[t, i] for t in range(T) for i in range(n)) +
+                   quicksum(u_2_ti_fixed[t, i] * quicksum(d[j] * x[t, j] for j in range(n)) for t in range(T) for i in range(n)) +
+                   quicksum(u_0_tij_fixed[t, i, j] * (1 - d[j] * x[t, j]) for t in range(T) for i in range(n) for j in range(n)) +
+                   quicksum(u_1_tij_fixed[t, i, j] * (1 - x[t, j]) for t in range(T) for i in range(n) for j in range(n) if j != i) +
+                   quicksum(v_0_fixed[i] + v_1_fixed[i] for i in range(n)) +
+                   quicksum(v_0_ti_fixed[t, i] + v_1_ti_fixed[t, i] for t in range(T) for i in range(n))
+                    >=R, name="Optimality Cut")
+
+       master.update()           
+       
+       # 4. Update the upper bound
+       temp=n+sum(b_t[t] for t in range(T))-secondstage_optval
+       if temp<Upperbound:
+           Upperbound=temp
+           x_fixed_0=x_fixed
+           b_t_0=b_t
+       
+       UB.append(Upperbound)
+       
+   stop = timeit.default_timer()
+   Time = stop - start
+ 
+   return x_fixed_0,b_t_0,Upperbound,master.status,UB,LB,Time
+# In[6]
+def One_Stage_MIP(T,D):
+   gap = 0
+#   global MIP_D
+   # Upper bound on total number of items for an individual test
+   G = n  
+
+#   print("MIP "+str(D))
+#   MIP_D=D
+   
+   # Create model
+   model = Model("One_Stage_MIP")
+
+   model.params.OutputFlag = 0
+   model.params.LogToConsole = 0
+#   model.params.MIPGap = 0.1
+   model.setParam('TimeLimit', 1800)
+   
+   # Decision variables
+   x = model.addVars(T, n, vtype=GRB.BINARY, name="x")
+   b = model.addVars(T, vtype=GRB.BINARY, name="b")
+   R = model.addVar(vtype=GRB.CONTINUOUS, name="R")
+   z_0_ti = model.addVars(T, n, K, vtype=GRB.BINARY, name="z_0_ti")
+   z_1_ti = model.addVars(T, n, K, vtype=GRB.BINARY, name="z_1_ti")
+   z_0_i = model.addVars(n, K, vtype=GRB.BINARY, name="z_0_i")
+   z_1_i = model.addVars(n, K, vtype=GRB.BINARY, name="z_1_i")
+
+   # Objective function
+   model.setObjective(n + quicksum(b[t] for t in range(T)) - R, GRB.MINIMIZE)
+          
+   # Constraints
+   # 1. Capacity constraint
+   model.addConstrs((quicksum(x[t, i] for i in range(n)) <= G * b[t] for t in range(T)), "Capacity")
+   
+   # 2. Test number constraints
+   model.addConstrs((quicksum(x[t, i]  for t in range(T)) <= r for i in range(n)), "Test size")       
+    
+   # 3. R upper bound
+   model.addConstrs((R <= quicksum(z_0_i[i, k] + z_1_i[i, k] for i in range(n)) for k in range(K)), "R_Upper_Bound")
+
+   # 4. z_0_ti constraints
+   model.addConstrs((z_0_ti[t, i, k] <= x[t, i] for t in range(T) for i in range(n) for k in range(K)), "z_0_ti_L1")
+
+   model.addConstrs((z_0_ti[t, i, k] <= 1 - D[k,j] * x[t, j] 
+                         for t in range(T) for i in range(n) for k in range(K) for j in range(n)), "z_0_ti_L2")
+   
+   model.addConstrs((z_0_i[i, k] <= quicksum(z_0_ti[t, i, k] for t in range(T)) 
+                         for i in range(n) for k in range(K)), "z_0_i_Sum")
+       
+   # 5. z_1_ti constraints
+   model.addConstrs((z_1_ti[t, i, k] <= x[t, i] for t in range(T) for i in range(n) for k in range(K)), "z_1_ti_L1")
+   model.addConstrs((z_1_ti[t, i, k] <= quicksum(D[k,j] * x[t, j] for j in range(n)) 
+                         for t in range(T) for i in range(n) for k in range(K)), "z_1_ti_L2")
+   model.addConstrs((z_1_ti[t, i, k] <= 1 - x[t, j] + z_0_i[j, k] 
+                         for t in range(T) for i in range(n) for j in range(n) if j != i for k in range(K)), "z_1_ti_L3")
+   model.addConstrs((z_1_i[i, k] <= quicksum(z_1_ti[t, i, k] for t in range(T)) 
+                         for i in range(n) for k in range(K)), "z_1_i_Sum")
+   
+    
+   # 6. Solve the model
+   model.optimize()
+   
+   # 7. Display the results
+   x_ti = {(t, i): x[t, i].x for t in range(T) for i in range(n)}
+   x_ti = np.reshape(np.array(list(x_ti.values())),(T,n))
+   b_t = {t: b[t].x for t in range(T)}
+   b_t = np.array(list(b_t.values()))
+   ObjVal= model.objval 
+   Time = model.Runtime
+   if model.status!=GRB.OPTIMAL:
+       gap = model.MIPGap
+       
+   return x_ti,b_t,ObjVal,gap,model.status,Time
+# In[7]
+def calc_by_logic(X, d):
+    # Gets number of retests based on logic
+    X=np.round(X)
+    X_certify = X.copy()
+    T, n = X.shape
+    test_result = np.where(X @ d > 0, 1, 0)
+    item_status = np.array(['retest'] * n, dtype='<U13')
+    for test_idx, group_i_result in enumerate(test_result):
+        if group_i_result == 0:
+            for item_idx, item in enumerate(X[test_idx]):
+                if item == 1:
+                    X_certify[:, item_idx] = 0
+                    item_status[item_idx] = 'non-defective'
+                  
+                    
+    confirming_defective = X_certify @ np.ones(n)
+    for test_idx, n_defective in enumerate(confirming_defective):
+        if n_defective == 1:
+            for item_idx, item in enumerate(X_certify[test_idx]):
+                if item == 1:
+                    item_status[item_idx] = 'defective' 
+                    
+  
+    n_certified = np.sum(item_status != 'retest')
+    return n_certified
+# In[8]
+def enumeration(T,D):
+     first_stage_value=1e+5
+     for ind, value in enumerate(itertools.product([0, 1], repeat=T*n)):
+          x=np.array(value).reshape(T,n)
+          b=np.zeros(T)
+          b[np.nonzero(sum(x[:,i] for i in range(n)))]=1
+          # 1. Parallel execution of subproblems
+          def solve_one_scenario(d):
+              n_certified = calc_by_logic(x, d)
+              return d, n_certified
+              
+          with ThreadPoolExecutor(max_workers=K) as executor:
+                 results = list(executor.map(solve_one_scenario, D))
+                 
+          min_result = min(results, key=lambda x: x[1])
+          secondstage_optval = min_result[1]
+          
+          first_stage_Objval = n + sum(b) - secondstage_optval
+          
+          if first_stage_value>first_stage_Objval:
+              first_stage_value=first_stage_Objval
+              x_opt=x
+              b_opt=b
+              
+     return x_opt,b_opt,first_stage_value
+# In[9]
+iter_max=1#int(np.floor(pow(2,n)/K))
+#sample_D={i: 0 for i in range(iter_max)}
+value_1={i: 1e+5 for i in range(iter_max)}
+x_ti_1={i: 0 for i in range(iter_max)}
+b_i_1={i: 0 for i in range(iter_max)}
+status_1={i: 0 for i in range(iter_max)}
+Time_1={i: 0 for i in range(iter_max)}
+gap_1={i: 0 for i in range(iter_max)}
+gap_2={i: 0 for i in range(iter_max)}
+ub_BD={i: 0 for i in range(iter_max)}
+lb_BD={i: 0 for i in range(iter_max)}
+value_2={i: 1e+5 for i in range(iter_max)}
+x_ti_2={i: 0 for i in range(iter_max)}
+b_i_2={i: 0 for i in range(iter_max)}
+status_2={i: 0 for i in range(iter_max)}
+Time_2={i: 0 for i in range(iter_max)}
+value_3={i: 1e+5 for i in range(iter_max)}
+x_ti_3={i: 0 for i in range(iter_max)}
+b_i_3={i: 0 for i in range(iter_max)}
+
+m=int(n/2)
+
+for i in range(iter_max):
+    random.seed(i)
+    index = random.sample(range(n), m)
+    D=np.zeros(n)
+    D[list(index)]+=1
+    D=np.reshape(D, (1,n))  
+    while len(D) < K:
+       index = random.sample(range(n), m)
+       d=np.zeros(n)
+       d[list(index)]+=1
+       d=np.reshape(d, (1,n))  
+       # Check if the number is already in the list
+       if len(np.where(~(D-d).any(axis=1))[0])==0:
+           D=np.vstack([D,d])  
+ #   sample_D[i]=D
+    x_ti_1[i],b_i_1[i],ub_BD[i],lb_BD[i],value_1[i],gap_1[i],status_1[i],Time_1[i] = Bender_decomposition(T, D)
+    x_ti_2[i],b_i_2[i], value_2[i],gap_2[i],status_2[i],Time_2[i] = One_Stage_MIP(T, D)
+
+     
+#x_ti_3[i],b_i_3[i], value_3[i] = enumeration(T,D)
+
+df = pd.DataFrame(columns=[
+    'Optimal Value for Binary Programming',
+    'Solution Time (s) for Binary Programming',
+    'Optimal Value for Bender Decomposition',
+    'Solution Time (s) for Bender Decomposition'
+   # 'Real Optimal Value'
+])
+
+df['Optimal Value for Binary Programming'] = value_2
+df['Solution Time (s) for Binary Programming'] = Time_2
+df['Optimal Value for Bender Decomposition'] = value_1
+df['Solution Time (s) for Bender Decomposition'] = Time_1
+  #   df['Real Optimal Value'] = value_3
+
+# Optional: set index
+#df.index = np.arange(len(df)) + 1
+
+# Save CSV
+filename = f'results_K={K}_T={T}_n={n}.csv'
+df.to_csv(filename, index=True)
 n = 4  # Number of entities
 U = 100  # Upper bound on total number of tests
 
