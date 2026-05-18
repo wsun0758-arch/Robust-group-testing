@@ -148,9 +148,9 @@ def One_Stage_MIP(T,D):
    return x_ti,b_t,ObjVal,model.status
 
 
-value_1={i: 1e+5 for i in range(iter_max)}
-x_ti_1={i: 0 for i in range(iter_max)}
-b_i_1={i: 0 for i in range(iter_max)}
+value={i: 1e+5 for i in range(iter_max)}
+x_ti={i: 0 for i in range(iter_max)}
+b_i={i: 0 for i in range(iter_max)}
 
 for i in range(iter_max):
      random.seed(i)
@@ -163,9 +163,9 @@ for i in range(iter_max):
         if len(np.where(~(D-d).any(axis=1))[0])==0:
            D=np.vstack([D,d])
    
-        x_1,b_1,Q_value_1,status_1 = One_Stage_MIP(T,D)
+        x,b,Q_value,status = One_Stage_MIP(T,D)
      
-        if status_1==2:
-            value_1[i] = Q_value_1
-            x_ti_1[i] = x_1
-            b_i_1[i]= b_1
+        if status==2:
+            value[i] = Q_value
+            x_ti[i] = x
+            b_i[i]= b
