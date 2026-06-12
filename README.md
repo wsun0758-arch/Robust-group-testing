@@ -1,4 +1,4 @@
-# Robust-group-testing URL: https://hdl.handle.net/2123/35104
+# Robust-group-testing (URL: https://hdl.handle.net/2123/35104)
 
 Author: Wenjie Sun 
 
